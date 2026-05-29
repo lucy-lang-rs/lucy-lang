@@ -324,11 +324,11 @@ dependencies = [
 
 [[package]]
 name = "lucy-lang"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "lucy-lsp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "lucy-lang",
  "serde",
