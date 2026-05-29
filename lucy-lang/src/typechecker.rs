@@ -163,26 +163,35 @@ pub struct TypeError {
     pub message: String,
 }
 
+pub struct TypeCheckerModuleRegistry {
+    pub modules: HashMap<String, Namespace>,
+}
+
+impl TypeCheckerModuleRegistry {
+    pub fn new() -> Self {
+        Self { modules: HashMap::new() }
+    }
+}
+
 pub struct TypeChecker {
-    pub scopes:        ScopeStack,
-    pub type_arena:    TypeArena,
-    pub errors:        Vec<TypeError>,
-    pub current_class: Option<String>,
-    /// Return type of the function currently being checked. `Type::Unknown`
-    /// means no function is in scope or the return type was not declared.
-    current_return_ty: Type,
+    pub scopes:           ScopeStack,
+    pub type_arena:       TypeArena,
+    pub errors:           Vec<TypeError>,
+    pub current_class:    Option<String>,
+    pub module_registry:  TypeCheckerModuleRegistry,
+    current_return_ty:    Type,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
         let mut scopes = ScopeStack::new();
         scopes.push();
-
         Self {
             scopes,
-            type_arena:        TypeArena::new(),
-            errors:            vec![],
-            current_class:     None,
+            type_arena:       TypeArena::new(),
+            errors:           vec![],
+            current_class:    None,
+            module_registry:  TypeCheckerModuleRegistry::new(),  // <-- new
             current_return_ty: Type::Unknown,
         }
     }
@@ -216,14 +225,25 @@ impl TypeChecker {
             }
 
             AstNode::UseStmt { base_path, used } => {
-                // Resolve and clone the namespace fully before any mutation.
+                if used.is_empty() {
+                    let name = match &base_path.node {
+                        AstNode::Identifier(s) => s.clone(),
+                        _ => { self.error(stmt.span, "expected simple module name in bare use"); return; }
+                    };
+                    
+                    match self.module_registry.modules.get(&name).cloned() {
+                        Some(ns) => self.scopes.define_namespace(name, ns),
+                        None     => self.error(stmt.span, format!("unknown module '{}'", name)),
+                    }
+                    return;
+                }
+
                 let ns_opt = self.resolve_namespace_path(&base_path.node).cloned();
                 match ns_opt {
                     None => {
                         self.error(stmt.span, "unknown namespace");
                     }
                     Some(ns) => {
-                        // Collect what we need before touching self.
                         let mut to_define_locals: Vec<(String, Type)> = Vec::new();
                         let mut to_define_types:  Vec<(String, Type)> = Vec::new();
                         let mut unknown_imports:  Vec<String>          = Vec::new();
@@ -653,7 +673,6 @@ impl TypeChecker {
             AstNode::StringLiteral(_) => Type::String,
 
             AstNode::Identifier(name) => {
-                // Clone out of scope before any mutable borrow.
                 let info = self.scopes.resolve_local(name)
                     .map(|l| (l.moved, l.ty.clone()));
 
@@ -665,11 +684,14 @@ impl TypeChecker {
                         ty
                     }
                     None => {
-                        // Try type namespace.
                         let ty_opt = self.scopes.resolve_type(name).cloned();
                         match ty_opt {
                             Some(ty) => ty,
                             None => {
+                                // Check if it's a known namespace before erroring.
+                                if self.scopes.resolve_namespace(name).is_some() {
+                                    return Type::Unknown; // namespace ref, type resolved via DotIndex
+                                }
                                 self.error(expr.span, format!("undefined variable '{}'", name));
                                 Type::Unknown
                             }

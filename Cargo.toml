@@ -2,4 +2,5 @@
 members = [
     "lucy-lang",
     "lucy-lsp",
+    "lucy-run"
 ]

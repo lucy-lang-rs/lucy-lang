@@ -5,7 +5,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use lucy_lang::lexer::{tokenize, Token};
 use lucy_lang::parser::LucyParser;
-use lucy_lang::typechecker::{NamespaceBuilder, TypeChecker};
+use lucy_lang::typechecker::{TypeChecker};
+use lucy_lang::lib_std;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -327,14 +328,8 @@ fn parse_and_collect_errors(
 
     let mut checker = TypeChecker::new();
 
-    let stdio_type = NamespaceBuilder::construct(|ns| ns
-        .member("println", Type::Function(Box::new(FunctionType {
-            params: vec![Type::Unknown],
-            return_type: Box::new(Type::Empty)
-        })))
-    );
-    
-    checker.scopes.define_namespace("stdio".into(), stdio_type);
+    let stdio = lib_std::stdio_module();
+    stdio.register_into_type_registry(&mut checker.module_registry);
 
     checker.check_program(&ast);
 

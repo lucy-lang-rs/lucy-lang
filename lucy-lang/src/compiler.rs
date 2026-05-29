@@ -52,7 +52,7 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             children:        HashMap::new(),
             locals:          HashMap::new(),
@@ -269,7 +269,7 @@ pub struct LucyCompiler {
     pub proto_depth:        usize,
     pub type_arena:         TypeArena,
     pub macros:             HashMap<String, MacroDefinition>,
-    pub namespace_registry: HashMap<String, Namespace>,
+    pub module_registry: HashMap<String, Namespace>,
     pub root_proto_idx:     usize,
     current_namespace_name: Option<String>,
     source:                 String,
@@ -277,14 +277,6 @@ pub struct LucyCompiler {
 }
 
 impl LucyCompiler {
-    pub fn register_native_namespace(
-        &mut self,
-        name: &str,
-        namespace: Namespace
-    ) {
-        self.namespace_registry.insert(name.to_string(), namespace);
-    }
-
     pub fn lulib_register_native_fn(
         &mut self, name: &str, arity: u8, func: fn(Vec<RuntimeValue>) -> RuntimeValue,
     ) -> usize {
@@ -318,7 +310,7 @@ impl LucyCompiler {
             source,
             current_span:       Span::dummy(),
             macros:             HashMap::new(),
-            namespace_registry: HashMap::new(),
+            module_registry: HashMap::new(),
             root_proto_idx:     0,
             current_namespace_name: None,
         };
@@ -739,20 +731,25 @@ impl LucyCompiler {
                 let mut path_parts = Vec::<String>::new();
                 Self::collect_dot_chain(&base_path.node, &mut path_parts);
 
-                let namespace = {
-                    Self::find_namespace_chained_static(&self.scopes, &path_parts)
-                        .cloned()
-                        .or_else(|| {
-                            if path_parts.len() == 1 {
-                                self.namespace_registry.get(&path_parts[0]).cloned()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("unknown namespace '{}'", path_parts.join("."))
-                        })
-                };
+                if used.is_empty() {
+                    let leaf = path_parts.last().cloned().unwrap_or_default();
+                    // Pull from module registry first, then fall back to scopes
+                    let ns = self.module_registry.get(&leaf).cloned()
+                        .or_else(|| Self::find_namespace_chained_static(&self.scopes, &path_parts).cloned())
+                        .unwrap_or_else(|| panic!("unknown module '{}'", leaf));
+                    self.scopes.define_namespace(leaf, ns);
+                    return;
+                }
+
+                // For deconstructed imports, look in scopes (already-used modules) then registry
+                let namespace = Self::find_namespace_chained_static(&self.scopes, &path_parts)
+                    .cloned()
+                    .or_else(|| {
+                        if path_parts.len() == 1 {
+                            self.module_registry.get(&path_parts[0]).cloned()
+                        } else { None }
+                    })
+                    .unwrap_or_else(|| panic!("unknown namespace '{}'", path_parts.join(".")));
 
                 let resolved: Vec<(String, ConstantValue)> = used
                     .iter()
@@ -1341,105 +1338,6 @@ impl LucyCompiler {
 }
 
 impl LucyCompiler {
-    fn compile_import_file(&mut self, program: &SAst, ctx: &CompilingCtx) -> Namespace {
-        self.enter_proto("__import__".to_string(), 0);
-        self.enter_scope();
-
-        let stmts = match &program.node {
-            AstNode::Program(s) => s,
-            other => panic!("Expected Program, got {:?}", other),
-        };
-
-        let mut declared_name: Option<String> = None;
-        for stmt in stmts {
-            if let AstNode::ModuleStmt { name } = &stmt.node {
-                declared_name = Some(name.clone());
-                break;
-            }
-        }
-
-        for stmt in stmts {
-            if matches!(&stmt.node, AstNode::ModuleStmt { .. }) { continue; }
-            self.compile_stmt(stmt, ctx);
-        }
-
-        let mut ns = Namespace::new();
-        {
-            let scope = self.scopes.get_current_scope();
-
-            for (name, &_reg) in &scope.exports {
-                ns.locals.insert(name.clone(), (0, true));
-                if let Some(local) = scope.locals.get(name) {
-                    if let Some(cv) = &local.backing {
-                        ns.constants.insert(name.clone(), cv.clone());
-                    }
-                }
-            }
-
-            for (name, mac) in &scope.exported_macros {
-                ns.exported_macros.insert(name.clone(), mac.clone());
-            }
-
-            for name in &scope.exported_types {
-                if let Some(ty) = scope.types.get(name) {
-                    ns.types.insert(name.clone(), ty.clone());
-                }
-                if let Some(child_ns) = scope.namespaces.get(name) {
-                    let mut exported_child = child_ns.clone();
-                    for (method_name, (local_idx, _)) in &child_ns.locals {
-                        let qualified = format!("{}::{}", name, method_name);
-                        if let Some(local) = scope.locals.get(&qualified) {
-                            if let Some(cv) = &local.backing {
-                                exported_child.constants.insert(method_name.clone(), cv.clone());
-                            }
-                        }
-                    }
-                    ns.children.insert(name.clone(), exported_child);
-                }
-            }
-        }
-
-        self.exit_scope();
-        let import_proto = self.exit_proto();
-
-        let host_proto   = self.current_proto();
-        let proto_offset = host_proto.protos.len();
-
-        for nested in import_proto.protos {
-            host_proto.protos.push(nested);
-        }
-
-        for cv in ns.constants.values_mut() {
-            Self::offset_proto_idx(cv, proto_offset);
-        }
-
-        for child_ns in ns.children.values_mut() {
-            for cv in child_ns.constants.values_mut() {
-                Self::offset_proto_idx(cv, proto_offset);
-            }
-            for (_, (idx, _)) in child_ns.locals.iter_mut() {
-                *idx += proto_offset;
-            }
-        }
-
-        for (name, ty) in &ns.types {
-            if let Type::Class(id) = ty {
-                let class = self.type_arena.get_class_mut(*id);
-                if let Some(ConstantValue::ClassProto { methods, .. }) = &mut class.class_proto_constant {
-                    for (idx, _) in methods.iter_mut() { *idx += proto_offset; }
-                }
-                for (_, (_, proto_idx, _, _)) in class.methods.iter_mut() { *proto_idx += proto_offset; }
-                for (_, (proto_idx, _)) in class.operators.iter_mut() { *proto_idx += proto_offset; }
-            }
-        }
-
-        if let Some(name) = declared_name {
-            self.namespace_registry.insert(name, ns.clone());
-        }
-
-        ns
-    }
-
     fn offset_proto_idx(cv: &mut ConstantValue, offset: usize) {
         match cv {
             ConstantValue::FunctionProto(idx) => *idx += offset,

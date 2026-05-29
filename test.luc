@@ -1,27 +1,5 @@
 module Input
 
-use stdio.{println}
+use stdio
 
--- This is a person
-class Person
-    pub name: string
-    pub age: u8
-
-    pub func new(name: string, age: u8): Self
-        return Self {name = name, age = age}
-    end
-    pub func getAge(self, hi: u8): u8
-        return hi
-    end
-
-    operator+ (a: Self, b: i32): Self
-        let cls = Self {name = a.name, age = a.age + b :: u8}
-        return cls
-    end
-end
-
-let cls = Person.new("John", 10 :: u8)
-let age = cls.age
-println((cls:getAge(12 :: u8) + 100) :: u8)
-
-println((cls + 20).age)
+stdio.print("hi")

@@ -324,17 +324,24 @@ dependencies = [
 
 [[package]]
 name = "lucy-lang"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "lucy-lsp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lucy-lang",
  "serde",
  "serde_json",
  "tokio",
  "tower-lsp",
+]
+
+[[package]]
+name = "lucy-run"
+version = "1.1.0"
+dependencies = [
+ "lucy-lang",
 ]
 
 [[package]]

@@ -1380,10 +1380,7 @@ impl LucyParser {
                         }
                     }
                 }
-                other => {
-                    let span = self.peek_span();
-                    err_node!(self, span, "Expected '::' in use statement, got {:?}", other);
-                }
+                _ => break vec![],
             }
         };
 
