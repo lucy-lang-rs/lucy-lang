@@ -139,6 +139,9 @@ pub enum Opcode {
 
     TYCAST,
     TYOF,
+
+    SETGLOBAL,  // SETGLOBAL A Bx  — globals[constants[Bx]] = reg[A]
+    GETGLOBAL,  // GETGLOBAL A Bx  — reg[A] = globals[constants[Bx]]
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -334,6 +337,7 @@ pub struct LucyVM {
     pub registers:     Vec<RuntimeValue>,
     pub call_stack:    Vec<CallFrame>,
     pub open_upvalues: Vec<UpvalueCell>,
+    pub globals:       HashMap<String, RuntimeValue>,  // <-- new
 }
 
 impl LucyVM {
@@ -344,6 +348,7 @@ impl LucyVM {
             registers:     vec![RuntimeValue::Empty; 512],
             call_stack:    vec![],
             open_upvalues: vec![],
+            globals: HashMap::new(),
         }
     }
 
@@ -470,7 +475,7 @@ impl LucyVM {
             };
 
             let instr = self.protos[proto_idx]
-                .code[pc];
+                .code[pc]; // 478
             self.call_stack.last_mut().unwrap().pc += 1;
 
             let op = instr & 0x3F;
@@ -827,6 +832,28 @@ impl LucyVM {
                     }
                 };
                 write!(a, RuntimeValue::Type(ty));
+            }
+            
+            else if op == Opcode::SETGLOBAL as u32 {
+                let (_, a, bx) = unpack_abx(instr);
+                let name = match &self.protos[proto_idx].constants[bx as usize] {
+                    ConstantValue::String(s) => s.clone(),
+                    other => panic!("SETGLOBAL: expected String constant for name, got {:?}", other),
+                };
+                let value = read!(a);
+                self.globals.insert(name, value);
+            }
+
+            else if op == Opcode::GETGLOBAL as u32 {
+                let (_, a, bx) = unpack_abx(instr);
+                let name = match &self.protos[proto_idx].constants[bx as usize] {
+                    ConstantValue::String(s) => s.clone(),
+                    other => panic!("GETGLOBAL: expected String constant for name, got {:?}", other),
+                };
+                let value = self.globals.get(&name)
+                    .cloned()
+                    .unwrap_or(RuntimeValue::Empty);
+                write!(a, value);
             }
 
             else {

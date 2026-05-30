@@ -1,0 +1,7 @@
+module main
+
+use Lucy.LucyConfig
+
+global config = LucyConfig {
+    lib_path = "./luc_src"
+}

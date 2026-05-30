@@ -20,6 +20,9 @@ pub enum Token<'a> {
     AND,
     BANG,
 
+    ELLIPS,
+    REST,
+
     DECLARE,
     CLASS,
     TUPLE,
@@ -37,7 +40,6 @@ pub enum Token<'a> {
 
     IF,
     ELSE,
-    ELSEIF,
     IN,
 
     WHILE,
@@ -64,6 +66,8 @@ pub enum Token<'a> {
 
     OPERATOR,
     TYPEOF,
+    GLOBAL,
+    PATTERN,
 
     FSTRING_START,
     FSTRING_CHUNK(&'a str),
@@ -87,7 +91,6 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         m.insert("class",    Token::CLASS);
         m.insert("if",       Token::IF);
         m.insert("else",     Token::ELSE);
-        m.insert("elseif",   Token::ELSEIF);
         m.insert("while",    Token::WHILE);
         m.insert("for",      Token::FOR);
         m.insert("do",       Token::DO);
@@ -110,6 +113,8 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         m.insert("macro",  Token::MACRO);
         m.insert("tuple",  Token::TUPLE);
         m.insert("category",  Token::CATEGORY);
+        m.insert("global",  Token::GLOBAL);
+        m.insert("pat",  Token::PATTERN);
         m
     })
 }
@@ -399,7 +404,14 @@ fn tokenize_str(src: &'static str) -> Vec<SpannedToken<'static>> {
             }
 
             '.' => {
-                if cur.eat('.') { push!(Token::BINOP(".."), tok_start); }
+                if cur.eat('.') {
+                    if cur.eat('.') {
+                        push!(Token::ELLIPS, tok_start);
+                    }
+                    else {
+                        push!(Token::REST, tok_start);
+                    }
+                }
                 else            { push!(Token::PUNCT("."),  tok_start); }
             }
             ',' => push!(Token::PUNCT(","), tok_start),

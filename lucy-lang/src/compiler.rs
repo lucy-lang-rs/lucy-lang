@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ty::{Type, FunctionType, TypeArena, TypeId, ClassType};
 
@@ -19,6 +19,8 @@ use crate::lexer::Token;
 use crate::operator::Operator;
 use crate::span::Span;
 
+use crate::builtin_types::{BuiltinClass};
+
 pub fn span_to_location(source: &str, span: Span) -> String {
     if span == Span::dummy() {
         return "<unknown location>".to_string();
@@ -31,6 +33,21 @@ pub fn span_to_location(source: &str, span: Span) -> String {
 
 fn compile_error_at(source: &str, span: Span, msg: &str) -> ! {
     panic!("CompileError at {}: {}", span_to_location(source, span), msg)
+}
+
+#[derive(Clone)]
+pub struct VariadicTemplate {
+    pub fixed_params: Vec<BindingNode>,
+    pub vararg_type:  TypeNode,
+    pub return_type:  TypeNode,
+    pub body:         Box<SAst>,
+}
+
+#[derive(Clone)]
+pub struct PendingSpecialization {
+    pub name:         String,
+    pub vararg_count: usize,
+    pub ctx:          CompilingCtx,
 }
 
 #[derive(Debug)]
@@ -249,14 +266,15 @@ impl ScopeStack {
 }
 
 #[derive(Clone)]
-struct CompilingCtx {
+pub struct CompilingCtx {
     pub is_public:     bool,
     pub current_class: Option<String>,
+    pub is_inside_vararg: bool,
 }
 
 impl CompilingCtx {
     fn new() -> Self {
-        Self { is_public: false, current_class: None }
+        Self { is_public: false, current_class: None, is_inside_vararg: false }
     }
 }
 
@@ -271,6 +289,10 @@ pub struct LucyCompiler {
     pub macros:             HashMap<String, MacroDefinition>,
     pub module_registry: HashMap<String, Namespace>,
     pub root_proto_idx:     usize,
+    pub variadic_templates:         HashMap<String, VariadicTemplate>,
+    pub pending_specializations:    Vec<PendingSpecialization>,
+    pub completed_specializations:  HashSet<(String, usize)>,
+    pub current_vararg_regs:        Vec<usize>,
     current_namespace_name: Option<String>,
     source:                 String,
     current_span:           Span,
@@ -313,8 +335,13 @@ impl LucyCompiler {
             module_registry: HashMap::new(),
             root_proto_idx:     0,
             current_namespace_name: None,
+            completed_specializations: HashSet::new(),
+            current_vararg_regs: vec![],
+            pending_specializations: vec![],
+            variadic_templates: HashMap::new()
         };
         s.enter_proto("__main__".to_string(), 0);
+        s.enter_scope();
         s
     }
 
@@ -398,6 +425,54 @@ impl LucyCompiler {
         let idx = self.current_proto().upvalues.len();
         self.current_proto().upvalues.push(uv);
         idx
+    }
+}
+
+impl LucyCompiler {
+    pub fn register_builtin_class(&mut self, class: &BuiltinClass) {
+        use std::collections::HashMap;
+        use crate::ty::{ClassType, FunctionType};
+        use crate::vm::{ConstantValue, Opcode, pack_abx};
+
+        let mut fields          = Vec::new();
+        let mut field_index_map = HashMap::new();
+
+        for (i, f) in class.fields.iter().enumerate() {
+            field_index_map.insert(f.name.clone(), i);
+            fields.push((f.name.clone(), f.ty.clone(), f.is_public));
+        }
+
+        let mut methods     = HashMap::new();
+        let field_vis: Vec<bool> = fields.iter().map(|(_, _, p)| *p).collect();
+
+        // No real method protos for builtins (no body) — just register signatures
+        for (i, m) in class.methods.iter().enumerate() {
+            let fn_ty = FunctionType {
+                params:      m.params.iter().map(|(_, t)| t.clone()).collect(),
+                return_type: Box::new(m.return_type.clone()),
+            };
+            methods.insert(m.name.clone(), (i, 0usize, fn_ty, m.is_public));
+        }
+
+        let class_id = self.type_arena.alloc_class(ClassType {
+            name:                 class.name.clone(),
+            fields,
+            field_index_map,
+            methods,
+            operators:            HashMap::new(),
+            class_proto_constant: None,
+        });
+
+        // Build the ClassProto constant so NEWCLASS works at runtime
+        let class_proto = ConstantValue::ClassProto {
+            name:      class.name.clone(),
+            fields:    field_vis,
+            methods:   vec![],   // no method protos for pure-data builtins
+            operators: HashMap::new(),
+        };
+
+        self.type_arena.get_class_mut(class_id).class_proto_constant = Some(class_proto);
+        self.scopes.define_type(class.name.clone(), Type::Class(class_id));
     }
 }
 
@@ -540,8 +615,33 @@ impl LucyCompiler {
 }
 
 impl LucyCompiler {
+    fn compile_block_into(&mut self, node: &SAst, dst: usize, ctx: &CompilingCtx) {
+        match &node.node {
+            AstNode::Block(stmts) => {
+                self.enter_scope();
+                if stmts.is_empty() {
+                    // Empty block = Empty value, nothing to emit
+                } else {
+                    let (body, tail) = stmts.split_at(stmts.len() - 1);
+                    for s in body { self.compile_stmt(s, ctx); }
+                    // Tail expression goes into dst
+                    self.compile_expr(&tail[0], dst, ctx);
+                }
+                self.exit_scope();
+            }
+            _ => {
+                // Single expression body
+                self.compile_expr(node, dst, ctx);
+            }
+        }
+    }
+
     fn compile_if(
-        &mut self, condition: &SAst, body: &[SAst], next: Option<&SAst>, ctx: &CompilingCtx,
+        &mut self,
+        condition: &SAst,
+        body:      &SAst,
+        else_body: Option<&SAst>,
+        ctx:       &CompilingCtx,
     ) {
         let saved    = self.reg_alloc.current_top;
         let cond_reg = self.reg_alloc.alloc();
@@ -555,16 +655,34 @@ impl LucyCompiler {
         self.emit(pack_abc(Opcode::JEQ as u32, 128, cond_reg as u32, false_reg as u32));
 
         self.reg_alloc.free_to(saved);
-        self.enter_scope();
-        for stmt in body { self.compile_stmt(stmt, ctx); }
-        self.exit_scope();
 
-        if let Some(next_branch) = next {
+        match &body.node {
+            AstNode::Block(stmts) => {
+                self.enter_scope();
+                for s in stmts { self.compile_stmt(s, ctx); }
+                self.exit_scope();
+            }
+            _ => { self.compile_stmt(body, ctx); }
+        }
+
+        if let Some(else_node) = else_body {
             let jump_over_else = self.current_proto().code.len();
             self.emit(pack_abc(Opcode::JMP as u32, 128, 0, 0));
             let else_start = self.current_proto().code.len();
             self.patch_jmp(jump_over_body, else_start);
-            self.compile_stmt(next_branch, ctx);
+
+            match &else_node.node {
+                AstNode::Block(stmts) => {
+                    self.enter_scope();
+                    for s in stmts { self.compile_stmt(s, ctx); }
+                    self.exit_scope();
+                }
+                AstNode::ConditionalBranch { condition, body, else_body } => {
+                    self.compile_if(condition, body, else_body.as_deref(), ctx);
+                }
+                _ => { self.compile_stmt(else_node, ctx); }
+            }
+
             let end_pc = self.current_proto().code.len();
             self.patch_jmp(jump_over_else, end_pc);
         } else {
@@ -573,7 +691,7 @@ impl LucyCompiler {
         }
     }
 
-    fn compile_while(&mut self, condition: &SAst, body: &[SAst], ctx: &CompilingCtx) {
+    fn compile_while(&mut self, condition: &SAst, body: &SAst, ctx: &CompilingCtx) {
         let saved      = self.reg_alloc.current_top;
         let cond_start = self.current_proto().code.len();
         let cond_reg   = self.reg_alloc.alloc();
@@ -590,8 +708,14 @@ impl LucyCompiler {
         let exit_jump = self.current_proto().code.len();
         self.emit(pack_abc(Opcode::JEQ as u32, 128, cond_reg as u32, false_reg as u32));
 
+        self.reg_alloc.free_to(saved);
         self.enter_scope();
-        for stmt in body { self.compile_stmt(stmt, ctx); }
+        match &body.node {
+            AstNode::Block(stmts) => {
+                for stmt in stmts { self.compile_stmt(stmt, ctx); }
+            }
+            _ => { self.compile_stmt(body, ctx); }
+        }
         self.exit_scope();
 
         self.reg_alloc.free_to(saved);
@@ -605,8 +729,34 @@ impl LucyCompiler {
     }
 
     fn compile_for(
-        &mut self, binding: &BindingNode, iterator: &SAst, body: &[SAst], ctx: &CompilingCtx,
+        &mut self, binding: &BindingNode, iterator: &SAst, body: &SAst, ctx: &CompilingCtx,
     ) {
+        if ctx.is_inside_vararg
+            && matches!(iterator.node, AstNode::Ellipsis)
+        {
+            let bind_name = match binding {
+                BindingNode::IdentifierBinding { name, .. } => name.clone(),
+                _ => "__arg".to_string(),
+            };
+
+            for &vreg in &self.current_vararg_regs.clone() {
+                self.enter_scope();
+
+                self.scopes.define_local(
+                    bind_name.clone(),
+                    vreg,
+                    Type::Unknown,
+                    None,
+                    false,
+                );
+
+                self.compile_stmt(body, ctx);
+
+                self.exit_scope();
+            }
+
+            return;
+        }
         self.enter_scope();
         let saved       = self.reg_alloc.current_top;
         let iter_reg    = self.reg_alloc.alloc();
@@ -634,7 +784,12 @@ impl LucyCompiler {
         self.emit(pack_abc(Opcode::JEQ as u32, 128, ge_reg as u32, true_reg as u32));
 
         self.reg_alloc.free_to(saved + 3);
-        for stmt in body { self.compile_stmt(stmt, ctx); }
+        match &body.node {
+            AstNode::Block(stmts) => {
+                for stmt in stmts { self.compile_stmt(stmt, ctx); }
+            }
+            _ => { self.compile_stmt(body, ctx); }
+        }
 
         let one_reg = self.reg_alloc.alloc();
         let k       = self.add_constant(ConstantValue::I32(1));
@@ -669,7 +824,12 @@ impl LucyCompiler {
                     self.reg_alloc.free_to(saved + 1);
 
                     self.enter_scope();
-                    for stmt in &arm.body { self.compile_stmt(stmt, ctx); }
+                    match &arm.body.node {
+                        AstNode::Block(stmts) => {
+                            for stmt in stmts { self.compile_stmt(stmt, ctx); }
+                        }
+                        _ => { self.compile_stmt(&arm.body, ctx); }
+                    }
                     self.exit_scope();
 
                     let exit_jump = self.current_proto().code.len();
@@ -686,7 +846,12 @@ impl LucyCompiler {
                     let compiled_ty = self.compile_type(ty);
                     self.scopes.define_local(name.clone(), bind_reg, compiled_ty, None, false);
 
-                    for stmt in &arm.body { self.compile_stmt(stmt, ctx); }
+                    match &arm.body.node {
+                        AstNode::Block(stmts) => {
+                            for stmt in stmts { self.compile_stmt(stmt, ctx); }
+                        }
+                        _ => { self.compile_stmt(&arm.body, ctx); }
+                    }
                     self.exit_scope();
 
                     let exit_jump = self.current_proto().code.len();
@@ -715,11 +880,8 @@ impl LucyCompiler {
             AstNode::Program(stmts) => {
                 self.enter_scope();
                 for node in stmts { self.compile_stmt(node, ctx); }
-                if let Some(LocalResolution::Local { reg, .. }) =
-                    self.scopes.resolve_local("main", self.proto_depth)
-                {
-                    self.emit(pack_abc(Opcode::CALL as u32, reg as u32, 0, 1));
-                }
+                
+                self.drain_specializations();
                 self.exit_scope();
             }
 
@@ -727,9 +889,29 @@ impl LucyCompiler {
                 self.current_namespace_name = Some(name.clone());
             }
 
+            AstNode::GlobalDeclaration { name, init_value } => {
+                let src = self.reg_alloc.alloc();
+                self.compile_expr(init_value, src, ctx);
+
+                let name_k = self.add_constant(ConstantValue::String(name.clone()));
+                self.emit(pack_abx(Opcode::SETGLOBAL as u32, src as u32, name_k as u32));
+
+                self.scopes.define_local(name.clone(), src, 
+                    self.infer_expr_type(&init_value.node, ctx), None, false);
+            }
+
             AstNode::UseStmt { base_path, used } => {
                 let mut path_parts = Vec::<String>::new();
                 Self::collect_dot_chain(&base_path.node, &mut path_parts);
+
+                // Auto-inject root into scopes from registry if missing
+                if let Some(root) = path_parts.first().cloned() {
+                    if Self::find_namespace_in_scopes(&self.scopes, &root).is_none() {
+                        if let Some(ns) = self.module_registry.get(&root).cloned() {
+                            self.scopes.define_namespace(root, ns);
+                        }
+                    }
+                }
 
                 if used.is_empty() {
                     let leaf = path_parts.last().cloned().unwrap_or_default();
@@ -873,35 +1055,48 @@ impl LucyCompiler {
                 }
             }
 
-            AstNode::FunctionDeclaration { name, params, type_params, return_type, body } => {
-                self.compile_function_decl(name, params, return_type, body, false, ctx);
+            AstNode::Block(stmts) => {
+                self.enter_scope();
+                for s in stmts { self.compile_stmt(s, ctx); }
+                self.exit_scope();
             }
 
-            AstNode::ClassDefinition { name, members } => {
-                self.compile_class_definition(name, members, ctx);
+            AstNode::FunctionDeclaration { name, params, vararg, return_type, body, .. } => {
+                if vararg.is_some() {
+                    self.variadic_templates.insert(name.clone(), VariadicTemplate {
+                        fixed_params: params.clone(),
+                        vararg_type:  vararg.clone().unwrap(),
+                        return_type:  return_type.clone(),
+                        body:         body.clone(),
+                    });
+                    let dst = self.reg_alloc.alloc();
+                    self.scopes.define_local(
+                        name.clone(), dst,
+                        Type::Unknown, None, false,
+                    );
+                } else {
+                    self.compile_function_decl(name, params, return_type, body, false, ctx);
+                }
+            }
+
+            AstNode::ConditionalBranch { condition, body, else_body } => {
+                self.compile_if(condition, body, else_body.as_deref(), ctx);
             }
 
             AstNode::WhileLoop { condition, body } => {
                 self.compile_while(condition, body, ctx);
             }
 
-            AstNode::ConditionalBranch { condition, body, next } => {
-                match condition {
-                    Some(cond) => self.compile_if(cond, body, next.as_deref(), ctx),
-                    None => {
-                        self.enter_scope();
-                        for s in body { self.compile_stmt(s, ctx); }
-                        self.exit_scope();
-                    }
-                }
+            AstNode::ForLoop { binding, iterator, body } => {
+                self.compile_for(binding, iterator, body, ctx);
             }
 
             AstNode::MatchStmt { matchee, arms } => {
                 self.compile_match(matchee, arms, ctx);
             }
 
-            AstNode::ForLoop { binding, iterator, body } => {
-                self.compile_for(binding, iterator, body, ctx);
+            AstNode::ClassDefinition { name, members } => {
+                self.compile_class_definition(name, members, ctx);
             }
 
             AstNode::ReturnStmt { value } => {
@@ -1001,6 +1196,147 @@ impl LucyCompiler {
 
             other => self.compile_error(&format!("Unhandled statement node: {:?}", other)),
         }
+    }
+}
+
+impl LucyCompiler {
+    pub fn drain_specializations(&mut self) {
+        while let Some(pending) = self.pending_specializations.pop() {
+            let key = (pending.name.clone(), pending.vararg_count);
+
+            if self.completed_specializations.contains(&key) {
+                continue;
+            }
+
+            self.completed_specializations.insert(key);
+
+            let template = self
+                .variadic_templates
+                .get(&pending.name)
+                .cloned()
+                .unwrap();
+
+            self.compile_variadic_specialization(
+                &pending.name,
+                pending.vararg_count,
+                &template,
+                &pending.ctx,
+            );
+        }
+    }
+
+    fn compile_variadic_specialization(
+        &mut self,
+        name: &str,
+        vararg_count: usize,
+        template: &VariadicTemplate,
+        ctx: &CompilingCtx,
+    ) {
+        let mangled = format!("{}#{}", name, vararg_count);
+
+        let mut all_params = template.fixed_params.clone();
+        let vararg_regs_start = all_params.len();
+
+        for i in 0..vararg_count {
+            all_params.push(BindingNode::IdentifierBinding {
+                name: format!("__v{}", i),
+                ty: template.vararg_type.clone(),
+            });
+        }
+
+        let arity = all_params.len() as u8;
+
+        self.enter_proto(mangled.clone(), arity);
+        self.enter_scope();
+
+        let mut vararg_regs = Vec::new();
+
+        for (i, param) in all_params.iter().enumerate() {
+            if let BindingNode::IdentifierBinding {
+                name: pname,
+                ty,
+            } = param
+            {
+                let compiled_ty = self.compile_type(ty);
+
+                self.scopes.define_local(
+                    pname.clone(),
+                    i,
+                    compiled_ty,
+                    None,
+                    false,
+                );
+
+                self.reg_alloc.alloc();
+
+                if i >= vararg_regs_start {
+                    vararg_regs.push(i);
+                }
+            }
+        }
+
+        let saved_vararg_regs =
+            std::mem::replace(&mut self.current_vararg_regs, vararg_regs);
+
+        let mut fn_ctx = ctx.clone();
+        fn_ctx.is_public = false;
+        fn_ctx.is_inside_vararg = true;
+
+        self.compile_stmt(&template.body, &fn_ctx);
+
+        self.current_vararg_regs = saved_vararg_regs;
+
+        self.exit_scope();
+
+        let proto = self.exit_proto();
+
+        let proto_idx = {
+            let parent = self.current_proto();
+            let idx = parent.protos.len();
+            parent.protos.push(proto);
+            idx
+        };
+
+        let cv_key = ConstantValue::String(mangled.clone());
+
+        for c in self.current_proto().constants.iter_mut() {
+            if *c == cv_key {
+                *c = ConstantValue::FunctionProto(proto_idx);
+            }
+        }
+
+        let cv = ConstantValue::FunctionProto(proto_idx);
+
+        let const_idx = self.add_constant(cv.clone());
+
+        let dst = self.reg_alloc.alloc();
+
+        self.emit(pack_abx(
+            Opcode::LOADK as u32,
+            dst as u32,
+            const_idx as u32,
+        ));
+
+        self.scopes.define_local(
+            mangled,
+            dst,
+            Type::Function(Box::new(FunctionType {
+                params: all_params
+                    .iter()
+                    .map(|p| match p {
+                        BindingNode::IdentifierBinding { ty, .. } => {
+                            self.compile_type(ty)
+                        }
+                        _ => Type::Unknown,
+                    })
+                    .collect(),
+                return_type: Box::new(
+                    self.compile_type(&template.return_type),
+                ),
+            })),
+            Some(cv),
+            false,
+        );
     }
 }
 
@@ -1170,13 +1506,29 @@ impl LucyCompiler {
                 let mut fn_ctx = class_ctx.clone();
                 fn_ctx.is_public = false;
 
-                let mut final_node: Option<&SAst> = None;
-                for stmt in body {
-                    final_node = Some(stmt);
-                    self.compile_stmt(stmt, &fn_ctx);
+                match &body.node {
+                    AstNode::Block(stmts) => {
+                        for stmt in stmts { self.compile_stmt(stmt, &fn_ctx); }
+                    }
+                    _ => { self.compile_stmt(body, &fn_ctx); }
                 }
 
-                if !matches!(final_node.map(|n| &n.node), Some(AstNode::ReturnStmt { .. })) {
+                let needs_implicit_ret = match &body.node {
+                    AstNode::Block(stmts) => {
+                        for stmt in stmts { self.compile_stmt(stmt, &fn_ctx); }
+                        !matches!(stmts.last().map(|n| &n.node), Some(AstNode::ReturnStmt { .. }))
+                    }
+                    AstNode::ReturnStmt { .. } => {
+                        self.compile_stmt(body, &fn_ctx);
+                        false
+                    }
+                    _ => {
+                        self.compile_stmt(body, &fn_ctx);
+                        true
+                    }
+                };
+
+                if needs_implicit_ret {
                     self.emit(pack_abc(Opcode::RET as u32, 0, 0, 0));
                 }
 
@@ -1228,8 +1580,13 @@ impl LucyCompiler {
 
                 let mut fn_ctx = class_ctx.clone();
                 fn_ctx.is_public = false;
-
-                for stmt in body { self.compile_stmt(stmt, &fn_ctx); }
+                
+                match &body.node {
+                    AstNode::Block(stmts) => {
+                        for stmt in stmts { self.compile_stmt(stmt, &fn_ctx); }
+                    }
+                    _ => { self.compile_stmt(body, &fn_ctx); }
+                }
 
                 self.exit_scope();
                 let real_proto = self.exit_proto();
@@ -1261,7 +1618,7 @@ impl LucyCompiler {
         name:        &str,
         params:      &[BindingNode],
         return_type: &TypeNode,
-        body:        &[SAst],
+        body:        &SAst,   // <-- was &[SAst]
         is_method:   bool,
         ctx:         &CompilingCtx,
     ) -> (usize, usize, FunctionType) {
@@ -1281,22 +1638,52 @@ impl LucyCompiler {
         }
 
         let declared_ret = self.compile_type(return_type);
+        let mut fn_ctx   = ctx.clone();
+        fn_ctx.is_public = false;
 
-        let mut fn_ctx     = ctx.clone();
-        fn_ctx.is_public   = false;
+        // Infer return type from tail if not declared
+        let inferred_ret = match &body.node {
+            AstNode::Block(stmts) => stmts.last()
+                .map(|t| self.infer_expr_type(&t.node, &fn_ctx))
+                .unwrap_or(Type::Empty),
+            _ => self.infer_expr_type(&body.node, &fn_ctx),
+        };
 
-        let mut inferred_ret = Type::Unknown;
-        for stmt in body {
-            if let AstNode::ReturnStmt { value: Some(expr) } = &stmt.node {
-                let t = self.infer_expr_type(&expr.node, &fn_ctx);
-                if !matches!(t, Type::Unknown) && matches!(inferred_ret, Type::Unknown) {
-                    inferred_ret = t.clone();
+        // Compile body — tail expression becomes implicit return
+        let ret_reg = self.reg_alloc.alloc();
+        match &body.node {
+            AstNode::Block(stmts) => {
+                if !stmts.is_empty() {
+                    let (head, tail) = stmts.split_at(stmts.len() - 1);
+                    for s in head { self.compile_stmt(s, &fn_ctx); }
+                    let tail_node = &tail[0];
+                    // If tail is already a return, compile as stmt; else compile into ret_reg
+                    match &tail_node.node {
+                        AstNode::ReturnStmt { .. } => {
+                            self.compile_stmt(tail_node, &fn_ctx);
+                        }
+                        _ => {
+                            self.compile_expr(tail_node, ret_reg, &fn_ctx);
+                            self.emit(pack_abc(Opcode::RET as u32, ret_reg as u32, 1, 0));
+                        }
+                    }
+                } else {
+                    self.emit(pack_abc(Opcode::RET as u32, 0, 0, 0));
                 }
             }
-            self.compile_stmt(stmt, &fn_ctx);
+            _ => {
+                match &body.node {
+                    AstNode::ReturnStmt { .. } => {
+                        self.compile_stmt(body, &fn_ctx);
+                    }
+                    _ => {
+                        self.compile_expr(body, ret_reg, &fn_ctx);
+                        self.emit(pack_abc(Opcode::RET as u32, ret_reg as u32, 1, 0));
+                    }
+                }
+            }
         }
 
-        self.emit(pack_abc(Opcode::RET as u32, 0, 0, 0));
         self.exit_scope();
         let proto = self.exit_proto();
 
@@ -1324,13 +1711,9 @@ impl LucyCompiler {
         self.emit(pack_abx(Opcode::LOADK as u32, dst as u32, const_idx as u32));
 
         if ctx.is_public {
-            self.scopes.define_export(
-                name.to_string(), dst, Type::Function(Box::new(fn_type.clone())), Some(cv), false,
-            );
+            self.scopes.define_export(name.to_string(), dst, Type::Function(Box::new(fn_type.clone())), Some(cv), false);
         } else {
-            self.scopes.define_local(
-                name.to_string(), dst, Type::Function(Box::new(fn_type.clone())), Some(cv), false,
-            );
+            self.scopes.define_local(name.to_string(), dst, Type::Function(Box::new(fn_type.clone())), Some(cv), false);
         }
 
         (dst, proto_local_idx, fn_type)
@@ -1397,7 +1780,7 @@ impl LucyCompiler {
                 let k = self.add_constant(ConstantValue::String(s.clone()));
                 self.emit(pack_abx(Opcode::LOADK as u32, dst as u32, k as u32));
             }
-
+            
             AstNode::SelfExpr => {
                 match self.scopes.resolve_local("self", self.proto_depth) {
                     Some(LocalResolution::Local { reg, .. }) => {
@@ -1524,6 +1907,76 @@ impl LucyCompiler {
             }
 
             AstNode::FunctionCall { callee, args } => {
+                let callee_name = match &callee.node {
+                    AstNode::Identifier(s) => Some(s.clone()),
+                    _ => None,
+                };
+
+                let is_variadic = callee_name.as_ref()
+                    .map(|n| self.variadic_templates.contains_key(n))
+                    .unwrap_or(false);
+
+                if is_variadic {
+                    let name         = callee_name.unwrap();
+                    let fixed_count  = self.variadic_templates[&name].fixed_params.len();
+                    let vararg_count = if args.len() > fixed_count {
+                        if args.last().map(|a| matches!(a.node, AstNode::Ellipsis)).unwrap_or(false) {
+                            self.current_vararg_regs.len()
+                        } else {
+                            args.len() - fixed_count
+                        }
+                    } else { 0 };
+
+                    let mangled = format!("{}#{}", name, vararg_count);
+
+                    if !self.completed_specializations.contains(&(name.clone(), vararg_count)) {
+                        self.pending_specializations.push(PendingSpecialization {
+                            name:         name.clone(),
+                            vararg_count,
+                            ctx:          ctx.clone(),
+                        });
+                    }
+
+                    let cv        = ConstantValue::String(mangled.clone());
+                    let const_idx = self.add_constant(cv);
+                    self.emit(pack_abx(Opcode::LOADK as u32, dst as u32, const_idx as u32));
+
+                    self.reg_alloc.current_top = dst + 1;
+
+                    let template     = self.variadic_templates[&name].clone();
+                    let fixed_count  = template.fixed_params.len();
+
+                    for arg in &args[..fixed_count.min(args.len())] {
+                        let arg_reg = self.reg_alloc.alloc();
+                        let saved   = self.reg_alloc.current_top;
+                        self.compile_expr(arg, arg_reg, ctx);
+                        self.reg_alloc.current_top = saved;
+                    }
+
+                    if args.last().map(|a| matches!(a.node, AstNode::Ellipsis)).unwrap_or(false) {
+                        for &vreg in &self.current_vararg_regs.clone() {
+                            let arg_reg = self.reg_alloc.alloc();
+                            self.emit(pack_abc(Opcode::MOVE as u32, arg_reg as u32, vreg as u32, 0));
+                        }
+                    } else {
+                        for arg in &args[fixed_count..] {
+                            let arg_reg = self.reg_alloc.alloc();
+                            let saved   = self.reg_alloc.current_top;
+                            self.compile_expr(arg, arg_reg, ctx);
+                            self.reg_alloc.current_top = saved;
+                        }
+                    }
+
+                    self.emit(pack_abc(
+                        Opcode::CALL as u32,
+                        dst as u32,
+                        args.len() as u32,
+                        1,
+                    ));
+                    self.reg_alloc.current_top = dst + 1;
+                    return;
+                }
+
                 self.compile_expr(callee, dst, ctx);
 
                 let implicit_self = matches!(&callee.node, AstNode::MethodCall { .. });
@@ -1698,6 +2151,16 @@ impl LucyCompiler {
                 ));
             }
 
+            // AstNode::WhileLoop { condition, body } => {
+            //     self.compile_while(condition, body, ctx);
+            //     let k = self.add_constant(ConstantValue::)
+            //     self.emit(pack_abx(Opcode::LOADK as u32, dst as u32, k as u32));
+            // }
+
+            // AstNode::ForLoop { binding, iterator, body } => {
+            //     self.compile_for(binding, iterator, body, ctx);
+            // }
+
             AstNode::TypeCast { left, right } => {
                 let target_ty = self.compile_type(right);
                 let src_reg   = self.reg_alloc.alloc();
@@ -1705,6 +2168,94 @@ impl LucyCompiler {
                 let ty_const = self.add_constant(ConstantValue::Type(target_ty));
                 self.emit(pack_abc(Opcode::TYCAST as u32, dst as u32, src_reg as u32, ty_const as u32));
                 self.reg_alloc.free_to(src_reg);
+            }
+
+            AstNode::Block(stmts) => {
+                self.enter_scope();
+                if !stmts.is_empty() {
+                    let (body, tail) = stmts.split_at(stmts.len() - 1);
+                    for s in body { self.compile_stmt(s, ctx); }
+                    self.compile_expr(&tail[0], dst, ctx);
+                }
+                self.exit_scope();
+            }
+
+            AstNode::ConditionalBranch { condition, body, else_body } => {
+                let saved    = self.reg_alloc.current_top;
+                let cond_reg = self.reg_alloc.alloc();
+                self.compile_expr(condition, cond_reg, ctx);
+
+                let false_reg = self.reg_alloc.alloc();
+                let k = self.add_constant(ConstantValue::I32(0));
+                self.emit(pack_abx(Opcode::LOADK as u32, false_reg as u32, k as u32));
+
+                let jump_over_body = self.current_proto().code.len();
+                self.emit(pack_abc(Opcode::JEQ as u32, 128, cond_reg as u32, false_reg as u32));
+                self.reg_alloc.free_to(saved);
+
+                self.compile_block_into(body, dst, ctx);
+
+                let jump_over_else = self.current_proto().code.len();
+                self.emit(pack_abc(Opcode::JMP as u32, 128, 0, 0));
+
+                let else_start = self.current_proto().code.len();
+                self.patch_jmp(jump_over_body, else_start);
+
+                if let Some(e) = else_body {
+                    self.compile_block_into(e, dst, ctx);
+                }
+
+                let end_pc = self.current_proto().code.len();
+                self.patch_jmp(jump_over_else, end_pc);
+            }
+
+            AstNode::MatchStmt { matchee, arms } => {
+                let saved       = self.reg_alloc.current_top;
+                let matchee_reg = self.reg_alloc.alloc();
+                self.compile_expr(matchee, matchee_reg, ctx);
+
+                let mut exit_jumps: Vec<usize> = Vec::new();
+
+                for arm in arms {
+                    match &arm.pattern {
+                        MatchPattern::Expr(pat_expr) => {
+                            let pat_reg = self.reg_alloc.alloc();
+                            self.compile_expr(pat_expr, pat_reg, ctx);
+
+                            let skip_jump = self.current_proto().code.len();
+                            self.emit(pack_abc(Opcode::JNE as u32, 128, matchee_reg as u32, pat_reg as u32));
+                            self.reg_alloc.free_to(saved + 1);
+
+                            self.compile_block_into(&arm.body, dst, ctx);
+
+                            let exit_jump = self.current_proto().code.len();
+                            self.emit(pack_abc(Opcode::JMP as u32, 128, 0, 0));
+                            exit_jumps.push(exit_jump);
+
+                            let next_arm = self.current_proto().code.len();
+                            self.patch_jmp(skip_jump, next_arm);
+                        }
+                        MatchPattern::Binding(BindingNode::IdentifierBinding { name, ty }) => {
+                            self.enter_scope();
+                            let bind_reg = self.reg_alloc.alloc();
+                            self.emit(pack_abc(Opcode::MOVE as u32, bind_reg as u32, matchee_reg as u32, 0));
+                            let compiled_ty = self.compile_type(ty);
+                            self.scopes.define_local(name.clone(), bind_reg, compiled_ty, None, false);
+
+                            self.compile_block_into(&arm.body, dst, ctx);
+                            self.exit_scope();
+
+                            let exit_jump = self.current_proto().code.len();
+                            self.emit(pack_abc(Opcode::JMP as u32, 128, 0, 0));
+                            exit_jumps.push(exit_jump);
+                        }
+                        other => panic!("Unhandled match pattern: {:?}", other),
+                    }
+                }
+
+                let end_pc = self.current_proto().code.len();
+                for jump_idx in exit_jumps { self.patch_jmp(jump_idx, end_pc); }
+                self.reg_alloc.free_to(saved);
             }
 
             other => self.compile_error(&format!("Unhandled expression node: {:?}", other)),

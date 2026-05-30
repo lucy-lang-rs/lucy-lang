@@ -13,4 +13,7 @@ pub mod span;
 pub mod module;
 pub mod lib_std;
 
+pub mod builtin_types;
+pub mod lucy_mod;
+
 fn main(){}

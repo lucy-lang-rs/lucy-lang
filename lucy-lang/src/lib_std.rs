@@ -1,4 +1,4 @@
-use crate::module::Module;
+use crate::module::{Module, ModuleClass, ModuleField};
 use crate::ty::{FunctionType, Type};
 
 pub fn stdio_module() -> Module {

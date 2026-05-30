@@ -1,0 +1,12 @@
+module main
+
+use stdio.{println, print}
+
+func IAmVariadic(...int): int do
+    for arg in ... do
+        println(arg)
+    end
+    return 0
+end
+
+IAmVariadic(1, 2, 3, 4)

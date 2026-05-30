@@ -138,10 +138,6 @@ pub struct MacroDefinition {
     pub arms: Vec<MacroArm>,
 }
 
-// ---------------------------------------------------------------------------
-// Type nodes
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeNode {
     NominalType { name: String, generics: Vec<TypeNode> },
@@ -150,10 +146,6 @@ pub enum TypeNode {
     Qualified   { inner: Box<TypeNode>, mutable: bool, borrowed: bool, moved: bool },
     Inferred,
 }
-
-// ---------------------------------------------------------------------------
-// Binding / pattern nodes
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindingNode {
@@ -174,12 +166,8 @@ pub enum MatchPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
-    pub body:    Vec<SAst>,
+    pub body:    Box<SAst>,
 }
-
-// ---------------------------------------------------------------------------
-// Class / category members
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClassMember {
@@ -193,15 +181,16 @@ pub enum ClassMember {
         type_params: Vec<(TypeNode, Option<TypeNode>)>,
         has_self:    bool,
         params:      Vec<BindingNode>,
+        vararg:      Option<TypeNode>,
         return_type: TypeNode,
-        body:        Vec<SAst>,
+        body:        SAst,
         is_public:   bool,
     },
     OperatorOverload {
         op:          Operator,
         params:      Vec<BindingNode>,
         return_type: TypeNode,
-        body:        Vec<SAst>,
+        body:        SAst,
     },
 }
 
@@ -219,19 +208,11 @@ pub struct NamedTupleDef {
     pub methods: Vec<ClassMember>,
 }
 
-// ---------------------------------------------------------------------------
-// Format-string parts
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum FmtPart {
     Literal(String),
     Expr(SAst),
 }
-
-// ---------------------------------------------------------------------------
-// AST node
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstNode {
@@ -249,16 +230,13 @@ pub enum AstNode {
         binding:    BindingNode,
         init_value: Option<Box<SAst>>,
     },
+    GlobalDeclaration {
+        name:       String,
+        init_value: Box<SAst>,
+    },
     Assignment {
         left:  Box<SAst>,
         right: Box<SAst>,
-    },
-    FunctionDeclaration {
-        name:        String,
-        type_params: Vec<(TypeNode, Option<TypeNode>)>,
-        params:      Vec<BindingNode>,
-        return_type: TypeNode,
-        body:        Vec<SAst>,
     },
     ReturnStmt { value: Option<Box<SAst>> },
 
@@ -281,21 +259,46 @@ pub enum AstNode {
     TypeInstantiation { callee: Box<SAst>, type_args: Vec<TypeNode> },
     TypeCast         { left: Box<SAst>, right: TypeNode },
 
-    ConditionalBranch {
-        condition: Option<Box<SAst>>,
-        body:      Vec<SAst>,
-        next:      Option<Box<SAst>>,
-    },
-    WhileLoop  { condition: Box<SAst>, body: Vec<SAst> },
-    MatchStmt  { matchee: Box<SAst>, arms: Vec<MatchArm> },
-    ForLoop    { binding: BindingNode, iterator: Box<SAst>, body: Vec<SAst> },
-
     ClassDefinition      { name: String, members: Vec<ClassMember> },
     NamedTupleDefinition(NamedTupleDef),
     CategoryDefinition   { name: String, variants: Vec<CategoryVariant> },
 
     MacroDefinitionNode(MacroDefinition),
     MacroInvocation { name: String, args: Vec<MacroTokenTree> },
+
+    Block(Vec<SAst>),  // last element is tail value; empty = Type::Empty
+
+    Ellipsis,  // `...` reference inside vararg body
+    FunctionDeclaration {
+        name:        String,
+        type_params: Vec<(TypeNode, Option<TypeNode>)>,
+        params:      Vec<BindingNode>,
+        vararg:      Option<TypeNode>,  // Some(ty) if function is variadic
+        return_type: TypeNode,
+        body:        Box<SAst>,
+    },
+
+    ConditionalBranch {
+        condition: Box<SAst>,
+        body:      Box<SAst>,
+        else_body: Option<Box<SAst>>,  // another ConditionalBranch or a Block/expr
+    },
+
+    WhileLoop {
+        condition: Box<SAst>,
+        body:      Box<SAst>,
+    },
+
+    ForLoop {
+        binding:  BindingNode,
+        iterator: Box<SAst>,
+        body:     Box<SAst>,
+    },
+
+    MatchStmt {
+        matchee: Box<SAst>,
+        arms:    Vec<MatchArm>,
+    },
 
     /// Sentinel emitted when parsing fails but we want to continue.
     Error,
@@ -415,15 +418,24 @@ impl LucyParser {
 // ---------------------------------------------------------------------------
 
 impl LucyParser {
-    fn parse_body(&mut self, ctx: &ParsingContext) -> Vec<SAst> {
-        let mut body = Vec::new();
+    fn parse_block_body(&mut self, ctx: &ParsingContext) -> SAst {
+        let start = self.peek_span();
+        let mut stmts = Vec::new();
+        let mut end_span = start;
         loop {
             match self.peek_some() {
-                Token::END => { self.consume(); break; }
-                _          => body.push(self.parse_stmt(ctx)),
+                Token::END => { self.consume_end(&mut end_span); break; }
+                _ => stmts.push(self.parse_stmt(ctx)),
             }
         }
-        body
+        Self::spanned(AstNode::Block(stmts), start.merge(end_span))
+    }
+
+    fn parse_block_or_single(&mut self, ctx: &ParsingContext) -> SAst {
+        match self.peek_some() {
+            Token::DO => { self.consume(); self.parse_block_body(ctx) }
+            _         => self.parse_stmt(ctx),
+        }
     }
 
     /// Returns `None` on parse failure (error already recorded).
@@ -808,6 +820,8 @@ impl LucyParser {
     fn parse_stmt(&mut self, ctx: &ParsingContext) -> SAst {
         let start = self.peek_span();
         match self.peek_some() {
+            // In parser — parse_stmt or wherever VarDeclaration is parsed
+            Token::GLOBAL => { self.consume(); self.parse_global_declaration(ctx) }
             Token::FN       => { self.consume(); self.parse_fun_declaration(ctx) }
             Token::DECLARE  => { self.consume(); self.parse_var_declaration(ctx) }
             Token::FOR      => { self.consume(); self.parse_for_loop(ctx) }
@@ -1142,7 +1156,7 @@ impl LucyParser {
             TypeNode::Inferred
         };
 
-        let body = self.parse_body(ctx);
+        let body = self.parse_block_or_single(ctx);
 
         let operator = match op_str {
             "+" => Operator::Add,
@@ -1211,11 +1225,26 @@ impl LucyParser {
         }
 
         let mut params = Vec::new();
+        let mut vararg  = None;
+
         loop {
             match self.peek_some() {
                 Token::PAREN(")") => { self.consume(); break; }
                 Token::PUNCT(",") => { self.consume(); }
-                _                 => params.push(self.parse_binding(ctx)?),
+                Token::ELLIPS => {
+                    self.consume();
+                    let ty = match self.parse_type(ctx) {
+                        Some(t) => t,
+                        None    => return None,
+                    };
+                    vararg = Some(ty);
+                    self.expect_some(Token::PAREN(")"), "Expected ')' after vararg");
+                    break;
+                }
+                _ => match self.parse_binding(ctx) {
+                    Some(b) => params.push(b),
+                    None    => return None,
+                },
             }
         }
 
@@ -1226,7 +1255,7 @@ impl LucyParser {
             TypeNode::Inferred
         };
 
-        let body = self.parse_body(ctx);
+        let body = self.parse_block_or_single(ctx);
 
         Some(ClassMember::Method {
             name: method_name,
@@ -1234,6 +1263,7 @@ impl LucyParser {
             has_self,
             params,
             return_type,
+            vararg,
             body,
             is_public,
         })
@@ -1405,163 +1435,113 @@ impl LucyParser {
     }
 
     fn parse_for_loop(&mut self, ctx: &ParsingContext) -> SAst {
-        let start = self.peek_span();
-        if self.expect_some(Token::PAREN("("), "Expected '(' after for").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
+        let start   = self.peek_span();
         let binding = match self.parse_binding(ctx) {
             Some(b) => b,
             None    => return Self::spanned(AstNode::Error, start),
         };
-        if self.expect_some(Token::IN, "Expected 'in' after for-loop binding").is_none() {
+        if self.expect_some(Token::IN, "Expected 'in'").is_none() {
             return Self::spanned(AstNode::Error, start);
         }
-        let iterator = self.parse_expr(ctx);
-        if self.expect_some(Token::PAREN(")"), "Expected ')' after for loop head").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
-        let body = self.parse_body(ctx);
-        let end  = body.last().map(|s| s.span).unwrap_or(start);
-        Self::spanned(
-            AstNode::ForLoop { binding, iterator: Box::new(iterator), body },
-            start.merge(end),
-        )
+        // iterator can be `...` or a normal expr
+        let iterator = if let Token::ELLIPS = self.peek_some() {
+            let s = self.peek_span();
+            self.consume();
+            Self::spanned(AstNode::Ellipsis, s)
+        } else {
+            self.parse_expr(ctx)
+        };
+        let body = Box::new(self.parse_block_or_single(ctx));
+        let span = start.merge(body.span);
+        Self::spanned(AstNode::ForLoop { binding, iterator: Box::new(iterator), body }, span)
     }
 
     fn parse_while_loop(&mut self, ctx: &ParsingContext) -> SAst {
         let start = self.peek_span();
-        if self.expect_some(Token::PAREN("("), "Expected '(' after while").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
         let condition = self.parse_expr(ctx);
-        if self.expect_some(Token::PAREN(")"), "Expected ')' after while condition").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
-        let body = self.parse_body(ctx);
-        let end  = body.last().map(|s| s.span).unwrap_or(start);
-        Self::spanned(AstNode::WhileLoop { condition: Box::new(condition), body }, start.merge(end))
+        let body = Box::new(self.parse_block_or_single(ctx));
+        let span = start.merge(body.span);
+        Self::spanned(AstNode::WhileLoop { condition: Box::new(condition), body }, span)
     }
 
     fn parse_conditional_branch(&mut self, ctx: &ParsingContext) -> SAst {
         let start = self.peek_span();
-        if self.expect_some(Token::PAREN("("), "Expected '(' after if").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
+
         let condition = self.parse_expr(ctx);
-        if self.expect_some(Token::PAREN(")"), "Expected ')' after if condition").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
 
-        let mut body:     Vec<SAst>        = Vec::new();
-        let mut next:     Option<Box<SAst>> = None;
-        let mut end_span                    = start;
+        // Consume optional `do`
+        if let Token::DO = self.peek_some() { self.consume(); }
 
-        loop {
-            match self.peek_some() {
-                Token::END => {self.consume_end(&mut end_span); break;}
-                Token::ELSE => {
-                    let else_start = self.peek_span();
-                    self.consume();
-                    let mut else_body = Vec::new();
-                    loop {
-                        match self.peek_some() {
-                            Token::END => {
-                                if let Some((_, s)) = self.consume()
-                                {
-                                    end_span = s;
-                                }
-                                else
-                                {
-                                    self.push_error("No token".into(), end_span);
-                                }
-                                break;
-                            }
-                            _ => else_body.push(self.parse_stmt(ctx)),
-                        }
-                    }
-                    let else_end = else_body.last().map(|s| s.span).unwrap_or(else_start);
-                    next = Some(Box::new(Self::spanned(
-                        AstNode::ConditionalBranch { condition: None, body: else_body, next: None },
-                        else_start.merge(else_end),
-                    )));
-                    break;
-                }
-                Token::ELSEIF => {
-                    self.consume();
-                    let branch = self.parse_conditional_branch(ctx);
-                    end_span = branch.span;
-                    next = Some(Box::new(branch));
-                    break;
-                }
-                _ => body.push(self.parse_stmt(ctx)),
-            }
-        }
-
-        Self::spanned(
-            AstNode::ConditionalBranch { condition: Some(Box::new(condition)), body, next },
-            start.merge(end_span),
-        )
-    }
-
-    fn parse_match_stmt(&mut self, ctx: &ParsingContext) -> SAst {
-        let start = self.peek_span();
-        if self.expect_some(Token::PAREN("("), "Expected '(' after match").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
-        let matchee = self.parse_expr(ctx);
-        if self.expect_some(Token::PAREN(")"), "Expected ')' after match head").is_none() {
-            return Self::spanned(AstNode::Error, start);
-        }
-
-        let mut arms     = Vec::new();
+        // Read body until else/elseif/end
+        let mut body_stmts = Vec::new();
         let mut end_span = start;
 
         loop {
             match self.peek_some() {
-                Token::END => {self.consume_end(&mut end_span); break;}
+                Token::END | Token::ELSE | Token::IF => break,
+                _ => body_stmts.push(self.parse_stmt(ctx)),
+            }
+        }
+
+        let body = Box::new(Self::spanned(AstNode::Block(body_stmts), start));
+
+        let else_body: Option<Box<SAst>> = match self.peek_some() {
+            Token::END => {
+                self.consume_end(&mut end_span);
+                None
+            }
+            Token::ELSE => {
+                self.consume();
+                match self.peek_some() {
+                    Token::IF => {
+                        // `else if` chain — recurse, it will consume the final `end`
+                        self.consume();
+                        Some(Box::new(self.parse_conditional_branch(ctx)))
+                    }
+                    _ => {
+                        // `else do` or bare `else`
+                        if let Token::DO = self.peek_some() { self.consume(); }
+
+                        let mut else_stmts = Vec::new();
+                        loop {
+                            match self.peek_some() {
+                                Token::END => { self.consume_end(&mut end_span); break; }
+                                _ => else_stmts.push(self.parse_stmt(ctx)),
+                            }
+                        }
+                        Some(Box::new(Self::spanned(AstNode::Block(else_stmts), start)))
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let span = start.merge(end_span);
+        Self::spanned(AstNode::ConditionalBranch {
+            condition: Box::new(condition),
+            body,
+            else_body,
+        }, span)
+    }
+
+    fn parse_match_stmt(&mut self, ctx: &ParsingContext) -> SAst {
+        let start = self.peek_span();
+        let matchee = self.parse_expr(ctx);
+
+        let mut arms = Vec::new();
+        let mut end_span = start;
+
+        loop {
+            match self.peek_some() {
+                Token::END => { self.consume_end(&mut end_span); break; }
                 Token::PUNCT(",") => { self.consume(); }
                 _ => {
                     let pattern = self.parse_match_pattern(ctx);
-
-                    let body = match self.peek_some() {
-                        Token::FATARROW => {
-                            self.consume();
-                            match self.peek_some() {
-                                Token::PAREN("{") => {
-                                    self.consume();
-                                    let mut stmts = Vec::new();
-                                    loop {
-                                        match self.peek_some() {
-                                            Token::PAREN("}") => { self.consume(); break; }
-                                            _ => stmts.push(self.parse_stmt(ctx)),
-                                        }
-                                    }
-                                    stmts
-                                }
-                                _ => vec![self.parse_stmt(ctx)],
-                            }
-                        }
-                        Token::DO => {
-                            self.consume();
-                            let mut stmts = Vec::new();
-                            loop {
-                                match self.peek_some() {
-                                    Token::END => { self.consume(); break; }
-                                    _ => stmts.push(self.parse_stmt(ctx)),
-                                }
-                            }
-                            stmts
-                        }
-                        other => {
-                            let span = self.peek_span();
-                            err_node!(
-                                self, span,
-                                "Expected '=>' or 'do' after match pattern, got {:?}", other
-                            );
-                        }
-                    };
-
-                    if let Some(last) = body.last() { end_span = last.span; }
+                    if self.expect_some(Token::FATARROW, "Expected '=>' after match pattern").is_none() {
+                        break;
+                    }
+                    let body = Box::new(self.parse_block_or_single(ctx));
+                    end_span = body.span;
                     arms.push(MatchArm { pattern, body });
                 }
             }
@@ -1675,13 +1655,27 @@ impl LucyParser {
         Self::spanned(AstNode::VarDeclaration { binding, init_value }, start.merge(end))
     }
 
+    fn parse_global_declaration(&mut self, ctx: &ParsingContext) -> SAst {
+        let start = self.peek_span();
+        let name = match self.expect_any_some() {
+            Some((Token::IDENT(n), ..)) => n,
+            _    => return Self::spanned(AstNode::Error, start),
+        };
+        let init_value = {
+            self.consume();
+            Box::new(self.parse_expr(ctx))
+        };
+        let end = init_value.span;
+        Self::spanned(AstNode::GlobalDeclaration { name: name.to_string(), init_value }, start.merge(end))
+    }
+
     fn parse_fun_declaration(&mut self, ctx: &ParsingContext) -> SAst {
         let start = self.peek_span();
 
         let name = match self.expect_any_some() {
             Some((Token::IDENT(s), _)) => s.to_string(),
-            Some((other, span))        => err_node!(self, span, "Expected function name, got {:?}", other),
-            None                       => return Self::spanned(AstNode::Error, start),
+            Some((other, span)) => err_node!(self, span, "Expected function name, got {:?}", other),
+            None => return Self::spanned(AstNode::Error, start),
         };
 
         let mut type_params = Vec::new();
@@ -1694,32 +1688,39 @@ impl LucyParser {
                     _ => {
                         let node = match self.parse_type(ctx) {
                             Some(t) => t,
-                            None    => return Self::spanned(AstNode::Error, start),
+                            None => return Self::spanned(AstNode::Error, start),
                         };
                         let constraint = if let Token::PUNCT(":") = self.peek_some() {
                             self.consume();
-                            match self.parse_type(ctx) {
-                                Some(t) => Some(t),
-                                None    => return Self::spanned(AstNode::Error, start),
-                            }
-                        } else {
-                            None
-                        };
+                            self.parse_type(ctx)
+                        } else { None };
                         type_params.push((node, constraint));
                     }
                 }
             }
         }
 
-        if self.expect_some(Token::PAREN("("), "Expected '(' after function name").is_none() {
+        if self.expect_some(Token::PAREN("("), "Expected '('").is_none() {
             return Self::spanned(AstNode::Error, start);
         }
 
-        let mut params = Vec::new();
+        let mut params  = Vec::new();
+        let mut vararg  = None;
+
         loop {
             match self.peek_some() {
                 Token::PAREN(")") => { self.consume(); break; }
                 Token::PUNCT(",") => { self.consume(); }
+                Token::ELLIPS => {
+                    self.consume();
+                    let ty = match self.parse_type(ctx) {
+                        Some(t) => t,
+                        None    => return Self::spanned(AstNode::Error, start),
+                    };
+                    vararg = Some(ty);
+                    self.expect_some(Token::PAREN(")"), "Expected ')' after vararg");
+                    break;
+                }
                 _ => match self.parse_binding(ctx) {
                     Some(b) => params.push(b),
                     None    => return Self::spanned(AstNode::Error, start),
@@ -1737,13 +1738,16 @@ impl LucyParser {
             TypeNode::Inferred
         };
 
-        let body = if ctx.no_fn_body { Vec::new() } else { self.parse_body(ctx) };
-        let end  = body.last().map(|s| s.span).unwrap_or(start);
+        let body = if ctx.no_fn_body {
+            Box::new(Self::spanned(AstNode::Block(vec![]), start))
+        } else {
+            Box::new(self.parse_block_or_single(ctx))
+        };
 
-        Self::spanned(
-            AstNode::FunctionDeclaration { name, type_params, params, return_type, body },
-            start.merge(end),
-        )
+        let span = start.merge(body.span);
+        Self::spanned(AstNode::FunctionDeclaration {
+            name, type_params: vec![], params, vararg, return_type, body
+        }, span)
     }
 }
 
@@ -2011,6 +2015,10 @@ impl LucyParser {
             Token::INT(n)    => Self::spanned(AstNode::IntLiteral(n),                span),
             Token::FLOAT(f)  => Self::spanned(AstNode::FloatLiteral(f),              span),
             Token::STRING(s) => Self::spanned(AstNode::StringLiteral(s.to_string()), span),
+            Token::ELLIPS => {
+                self.consume();
+                Self::spanned(AstNode::Ellipsis, span)
+            }
 
             Token::IDENT(s) => {
                 let name = s.to_string();
@@ -2052,6 +2060,19 @@ impl LucyParser {
                     AstNode::UnaryOperation { op: Operator::Neg, right: Box::new(operand) },
                     span.merge(end),
                 )
+            }
+
+            Token::IF => {
+                self.consume();
+                self.parse_conditional_branch(ctx)
+            }
+            Token::MATCH => {
+                self.consume();
+                self.parse_match_stmt(ctx)
+            }
+            Token::DO => {
+                self.consume();
+                self.parse_block_body(ctx)
             }
 
             Token::BANG => {

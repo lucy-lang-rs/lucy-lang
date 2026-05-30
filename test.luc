@@ -1,5 +1,0 @@
-module Input
-
-use stdio
-
-stdio.print("hi")

@@ -15,6 +15,15 @@ use crate::ty::{
     ClassType, FunctionType, Type, TypeArena,
 };
 
+use crate::builtin_types::{BuiltinClass};
+
+#[derive(Debug, Clone)]
+pub struct VariadicFnTemplate {
+    pub fixed_params: Vec<(String, Type)>,
+    pub vararg_type:  Type,
+    pub return_type:  Type,
+}
+
 #[derive(Debug, Clone)]
 pub struct Local {
     pub ty:      Type,
@@ -179,7 +188,73 @@ pub struct TypeChecker {
     pub errors:           Vec<TypeError>,
     pub current_class:    Option<String>,
     pub module_registry:  TypeCheckerModuleRegistry,
+    pub variadic_templates:    HashMap<String, VariadicFnTemplate>,
+    pub current_vararg_type:   Option<Type>,
     current_return_ty:    Type,
+}
+
+impl TypeChecker {
+    pub fn compile_type_static(node: &TypeNode) -> Type {
+        match node {
+            TypeNode::Inferred => Type::Unknown,
+            TypeNode::ArrayType { elem_type } => {
+                Type::Array(Box::new(Self::compile_type_static(elem_type)))
+            }
+            TypeNode::Qualified { inner, mutable, borrowed, moved } => {
+                Type::Qualified {
+                    inner:    Box::new(Self::compile_type_static(inner)),
+                    mutable:  *mutable,
+                    borrowed: *borrowed,
+                    moved:    *moved,
+                }
+            }
+            TypeNode::NominalType { name, generics } => {
+                if let Some(builtin) = Self::resolve_builtin(name) { return builtin; }
+                let args: Vec<Type> = generics.iter()
+                    .map(|g| Self::compile_type_static(g))
+                    .collect();
+                if args.is_empty() { Type::TypeVar(name.clone()) }
+                else { Type::Generic { name: name.clone(), args } }
+            }
+            _ => Type::Unknown,
+        }
+    }
+}
+
+impl TypeChecker {
+    pub fn register_builtin_class(&mut self, class: &BuiltinClass) {
+        use std::collections::HashMap;
+        use crate::ty::{ClassType, FunctionType};
+
+        let mut fields         = Vec::new();
+        let mut field_index_map = HashMap::new();
+
+        for (i, f) in class.fields.iter().enumerate() {
+            field_index_map.insert(f.name.clone(), i);
+            fields.push((f.name.clone(), f.ty.clone(), f.is_public));
+        }
+
+        let mut methods = HashMap::new();
+        for (i, m) in class.methods.iter().enumerate() {
+            let fn_ty = FunctionType {
+                params:      m.params.iter().map(|(_, t)| t.clone()).collect(),
+                return_type: Box::new(m.return_type.clone()),
+            };
+            methods.insert(m.name.clone(), (i, 0usize, fn_ty, m.is_public));
+        }
+
+        let class_id = self.type_arena.alloc_class(ClassType {
+            name:                 class.name.clone(),
+            fields,
+            field_index_map,
+            methods,
+            operators:            HashMap::new(),
+            class_proto_constant: None,
+        });
+
+        // Make the class name resolve as a type globally
+        self.scopes.define_type(class.name.clone(), Type::Class(class_id));
+    }
 }
 
 impl TypeChecker {
@@ -193,6 +268,8 @@ impl TypeChecker {
             current_class:    None,
             module_registry:  TypeCheckerModuleRegistry::new(),  // <-- new
             current_return_ty: Type::Unknown,
+            variadic_templates:  HashMap::new(),
+            current_vararg_type: None,
         }
     }
 
@@ -200,17 +277,17 @@ impl TypeChecker {
         self.errors.push(TypeError { span, message: msg.into() });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Entry point
-    // ─────────────────────────────────────────────────────────────────────────
-
     pub fn check_program(&mut self, program: &SAst) {
         self.check_stmt(program);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Statement checking
-    // ─────────────────────────────────────────────────────────────────────────
+    // New helper — infer the type of a Block's tail
+    fn infer_block_type(&mut self, stmts: &[SAst]) -> Type {
+        match stmts.last() {
+            Some(tail) => self.infer_expr_type(tail),
+            None       => Type::Empty,
+        }
+    }
 
     pub fn check_stmt(&mut self, stmt: &SAst) {
         match &stmt.node {
@@ -224,18 +301,33 @@ impl TypeChecker {
                 self.check_stmt(inner);
             }
 
+            AstNode::GlobalDeclaration { name, init_value } => {
+                let ty = self.infer_expr_type(init_value);
+                self.scopes.define_local(name.clone(), ty, false);
+            }
+
             AstNode::UseStmt { base_path, used } => {
-                if used.is_empty() {
-                    let name = match &base_path.node {
-                        AstNode::Identifier(s) => s.clone(),
-                        _ => { self.error(stmt.span, "expected simple module name in bare use"); return; }
-                    };
-                    
-                    match self.module_registry.modules.get(&name).cloned() {
-                        Some(ns) => self.scopes.define_namespace(name, ns),
-                        None     => self.error(stmt.span, format!("unknown module '{}'", name)),
+                let root_name = match &base_path.node {
+                    AstNode::Identifier(s) => Some(s.clone()),
+                    AstNode::DotIndex { indexee, .. } => {
+                        fn first_ident(node: &AstNode) -> Option<String> {
+                            match node {
+                                AstNode::Identifier(s) => Some(s.clone()),
+                                AstNode::DotIndex { indexee, .. } => first_ident(&indexee.node),
+                                _ => None,
+                            }
+                        }
+                        first_ident(&base_path.node)
                     }
-                    return;
+                    _ => None,
+                };
+
+                if let Some(ref root) = root_name {
+                    if self.scopes.resolve_namespace(root).is_none() {
+                        if let Some(ns) = self.module_registry.modules.get(root).cloned() {
+                            self.scopes.define_namespace(root.clone(), ns);
+                        }
+                    }
                 }
 
                 let ns_opt = self.resolve_namespace_path(&base_path.node).cloned();
@@ -350,54 +442,93 @@ impl TypeChecker {
                 }
             }
 
-            AstNode::FunctionDeclaration { name, params, return_type, body, .. } => {
-                let fn_ty = self.build_fn_type(params, return_type);
-
-                self.scopes.define_local(
-                    name.clone(),
-                    Type::Function(Box::new(fn_ty.clone())),
-                    false,
-                );
-
-                let saved_ret          = self.current_return_ty.clone();
-                self.current_return_ty = *fn_ty.return_type.clone();
-
-                self.scopes.push();
-                self.register_params(params);
-                for s in body { self.check_stmt(s); }
-                self.scopes.pop();
-
-                self.current_return_ty = saved_ret;
-            }
-
             AstNode::ClassDefinition { name, members } => {
                 self.check_class_definition(name, members, stmt.span);
             }
 
-            AstNode::ConditionalBranch { condition, body, next } => {
-                if let Some(cond) = condition { self.infer_expr_type(cond); }
+            AstNode::Block(stmts) => {
                 self.scopes.push();
-                for s in body { self.check_stmt(s); }
+                for s in stmts { self.check_stmt(s); }
                 self.scopes.pop();
-                if let Some(next) = next { self.check_stmt(next); }
+            }
+
+            AstNode::FunctionDeclaration { name, params, vararg, return_type, body, .. } => {
+                if let Some(vararg_ty_node) = vararg {
+                    let vararg_type  = self.compile_type(vararg_ty_node);
+                    let return_type  = self.compile_type(return_type);
+                    let fixed: Vec<(String, Type)> = params.iter().filter_map(|p| {
+                        if let BindingNode::IdentifierBinding { name, ty } = p {
+                            Some((name.clone(), self.compile_type(ty)))
+                        } else { None }
+                    }).collect();
+
+                    self.scopes.define_local(
+                        name.clone(),
+                        Type::Function(Box::new(FunctionType {
+                            params:      fixed.iter().map(|(_, t)| t.clone()).collect(),
+                            return_type: Box::new(return_type.clone()),
+                        })),
+                        false,
+                    );
+
+                    self.variadic_templates.insert(name.clone(), VariadicFnTemplate {
+                        fixed_params: fixed,
+                        vararg_type,
+                        return_type,
+                    });
+                } else {
+                    let fn_ty = self.build_fn_type(params, return_type);
+                    self.scopes.define_local(
+                        name.clone(),
+                        Type::Function(Box::new(fn_ty.clone())),
+                        false,
+                    );
+                    let saved_ret          = self.current_return_ty.clone();
+                    self.current_return_ty = *fn_ty.return_type.clone();
+                    self.scopes.push();
+                    self.register_params(params);
+                    self.check_stmt(body);
+                    self.scopes.pop();
+                    self.current_return_ty = saved_ret;
+                }
+            }
+
+            AstNode::ConditionalBranch { condition, body, else_body } => {
+                self.infer_expr_type(condition);
+                self.check_stmt(body);
+                if let Some(e) = else_body { self.check_stmt(e); }
             }
 
             AstNode::WhileLoop { condition, body } => {
                 self.infer_expr_type(condition);
-                self.scopes.push();
-                for s in body { self.check_stmt(s); }
-                self.scopes.pop();
+                self.check_stmt(body);
             }
 
             AstNode::ForLoop { binding, iterator, body } => {
-                self.infer_expr_type(iterator);
-                self.scopes.push();
-                if let BindingNode::IdentifierBinding { name, ty } = binding {
-                    let compiled = self.compile_type(ty);
-                    self.scopes.define_local(name.clone(), compiled, false);
+                if matches!(iterator.node, AstNode::Ellipsis) {
+                    let elem_ty = match &self.current_vararg_type {
+                        Some(t) => t.clone(),
+                        None => {
+                            self.error(iterator.span, "'...' used outside of variadic function");
+                            Type::Unknown
+                        }
+                    };
+                    self.scopes.push();
+                    if let BindingNode::IdentifierBinding { name, .. } = binding {
+                        self.scopes.define_local(name.clone(), elem_ty, false);
+                    }
+                    self.check_stmt(body);
+                    self.scopes.pop();
+                } else {
+                    self.infer_expr_type(iterator);
+                    self.scopes.push();
+                    if let BindingNode::IdentifierBinding { name, ty } = binding {
+                        let compiled = self.compile_type(ty);
+                        self.scopes.define_local(name.clone(), compiled, false);
+                    }
+                    self.check_stmt(body);
+                    self.scopes.pop();
                 }
-                for s in body { self.check_stmt(s); }
-                self.scopes.pop();
             }
 
             AstNode::MatchStmt { matchee, arms } => {
@@ -415,7 +546,7 @@ impl TypeChecker {
                         }
                         _ => {}
                     }
-                    for s in &arm.body { self.check_stmt(s); }
+                    self.check_stmt(&arm.body);
                     self.scopes.pop();
                 }
             }
@@ -534,7 +665,6 @@ impl TypeChecker {
         for member in members {
             match member {
                 ClassMember::Method { name: method_name, params, return_type, body, .. } => {
-                    // Clone everything needed from the arena before touching self.
                     let (fn_ty, _) = {
                         let class = self.type_arena.get_class(class_id);
                         let (_, _, ft, is_pub) = class.methods.get(method_name).unwrap();
@@ -552,7 +682,7 @@ impl TypeChecker {
                     self.scopes.push();
                     self.scopes.define_local("self".into(), Type::Class(class_id), false);
                     self.register_params(params);
-                    for s in body { self.check_stmt(s); }
+                    self.check_stmt(body);
                     self.scopes.pop();
                 }
 
@@ -568,7 +698,7 @@ impl TypeChecker {
 
                     self.scopes.push();
                     self.register_params(params);
-                    for s in body { self.check_stmt(s); }
+                    self.check_stmt(body);
                     self.scopes.pop();
                 }
 
@@ -582,18 +712,46 @@ impl TypeChecker {
         self.current_return_ty = prev_return_ty;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Call checking
-    // ─────────────────────────────────────────────────────────────────────────
+    fn check_call(&mut self, callee: &SAst, args: &[SAst], span: Span) -> Type {
+        let callee_name = match &callee.node {
+            AstNode::Identifier(s) => Some(s.clone()),
+            _ => None,
+        };
 
-    fn check_call(
-        &mut self,
-        callee: &SAst,
-        args: &[SAst],
-        span: Span,
-    ) -> Type {
+        if let Some(ref name) = callee_name {
+            if let Some(template) = self.variadic_templates.get(name).cloned() {
+                let fixed_count = template.fixed_params.len();
+                if args.len() < fixed_count {
+                    self.error(span, format!(
+                        "expected at least {} argument(s), got {}",
+                        fixed_count, args.len()
+                    ));
+                    return template.return_type.clone();
+                }
+                for (arg, (_, param_ty)) in args[..fixed_count].iter()
+                    .zip(template.fixed_params.iter())
+                {
+                    let arg_ty = self.infer_expr_type(arg);
+                    self.assert_assignable(param_ty, &arg_ty, arg.span);
+                }
+                for arg in &args[fixed_count..] {
+                    if matches!(arg.node, AstNode::Ellipsis) {
+                        if self.current_vararg_type.is_none() {
+                            self.error(arg.span, "cannot forward '...' outside of a variadic function");
+                        }
+                        if let Some(ref cvt) = self.current_vararg_type.clone() {
+                            self.assert_assignable(&template.vararg_type, cvt, arg.span);
+                        }
+                    } else {
+                        let arg_ty = self.infer_expr_type(arg);
+                        self.assert_assignable(&template.vararg_type, &arg_ty, arg.span);
+                    }
+                }
+                return template.return_type.clone();
+            }
+        }
+        
         let callee_ty = self.infer_expr_type(callee);
-
         match callee_ty {
             Type::Function(fn_ty) => {
                 let params: Vec<Type> = fn_ty.params.clone();
@@ -652,9 +810,7 @@ impl TypeChecker {
 
                 ret_ty
             }
-
             Type::Unknown => Type::Unknown,
-
             _ => {
                 self.error(span, "attempt to call non-function");
                 Type::Unknown
@@ -698,6 +854,70 @@ impl TypeChecker {
                         }
                     }
                 }
+            }
+
+            AstNode::Ellipsis => {
+                match &self.current_vararg_type {
+                    Some(ty) => ty.clone(),
+                    None => {
+                        self.error(expr.span, "'...' used outside of a variadic function");
+                        Type::Unknown
+                    }
+                }
+            }
+
+            AstNode::Block(stmts) => {
+                for s in stmts { self.check_stmt(s); }
+                match stmts.last() {
+                    Some(tail) => self.infer_expr_type(tail),
+                    None       => Type::Empty,
+                }
+            }
+
+            AstNode::ConditionalBranch { condition, body, else_body } => {
+                self.infer_expr_type(condition);
+                let body_ty = self.infer_expr_type(body);
+                match else_body {
+                    Some(e) => {
+                        let else_ty = self.infer_expr_type(e);
+                        // Branches must converge
+                        if !matches!(body_ty, Type::Unknown) && !matches!(else_ty, Type::Unknown) {
+                            self.assert_assignable(&body_ty, &else_ty, e.span);
+                        }
+                        body_ty
+                    }
+                    None => {
+                        // if without else can't produce a value — only ok as a statement
+                        // We return Empty; the assignment context will catch the mismatch
+                        Type::Empty
+                    }
+                }
+            }
+
+            AstNode::MatchStmt { matchee, arms } => {
+                let matchee_ty = self.infer_expr_type(matchee);
+                let mut result_ty = Type::Unknown;
+                for arm in arms {
+                    self.scopes.push();
+                    match &arm.pattern {
+                        MatchPattern::Expr(expr) => {
+                            let pat_ty = self.infer_expr_type(expr);
+                            self.assert_assignable(&matchee_ty, &pat_ty, expr.span);
+                        }
+                        MatchPattern::Binding(BindingNode::IdentifierBinding { name, ty }) => {
+                            let compiled = self.compile_type(ty);
+                            self.scopes.define_local(name.clone(), compiled, false);
+                        }
+                        _ => {}
+                    }
+                    let arm_ty = self.infer_expr_type(&arm.body);
+                    if !matches!(result_ty, Type::Unknown) && !matches!(arm_ty, Type::Unknown) {
+                        self.assert_assignable(&result_ty, &arm_ty, arm.body.span);
+                    }
+                    if matches!(result_ty, Type::Unknown) { result_ty = arm_ty; }
+                    self.scopes.pop();
+                }
+                result_ty
             }
 
             AstNode::SelfExpr => {
@@ -796,15 +1016,20 @@ impl TypeChecker {
             }
 
             AstNode::DotIndex { indexee, index } => {
-                // Try namespace path first (returns a borrow, so clone it).
-                let ns_result = self.resolve_namespace_path(&expr.node).cloned();
+                let field = match &index.node {
+                    AstNode::Identifier(s) => s.clone(),
+                    _ => return Type::Unknown,
+                };
+
+                // Look up the namespace from the indexee only, not the full expr
+                let ns_result = self.resolve_namespace_path(&indexee.node).cloned();
                 if let Some(ns) = ns_result {
-                    let field = match &index.node {
-                        AstNode::Identifier(s) => s.as_str(),
-                        _ => return Type::Unknown,
-                    };
-                    if let Some(ty) = ns.locals.get(field) { return ty.clone(); }
-                    if let Some(ty) = ns.types.get(field)  { return ty.clone(); }
+                    if let Some(ty) = ns.locals.get(&field) { return ty.clone(); }
+                    if let Some(ty) = ns.types.get(&field)  { return ty.clone(); }
+
+                    // Namespace found but member doesn't exist
+                    self.error(expr.span, format!("module has no member '{}'", field));
+                    return Type::Unknown;
                 }
 
                 let obj_ty     = self.infer_expr_type(indexee);
@@ -1022,6 +1247,9 @@ impl TypeChecker {
             "u64"    => Some(Type::U64),   "i64"    => Some(Type::I64),
             "usize"  => Some(Type::USize), "bool"   => Some(Type::Bool),
             "string" => Some(Type::String),"empty"  => Some(Type::Empty),
+            "int" => Some(Type::I32),
+            "float" => Some(Type::F32),
+            "double" => Some(Type::F64),
             _        => None,
         }
     }
